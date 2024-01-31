@@ -5,32 +5,19 @@ use std::error::Error;
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 enum Type {
-    Literal(char),
-    Dot,
-    Star(Box<Type>),
+    Literal(usize),
+    Star(usize),
     Plus(usize),
-    Question(Box<Type>),
-    Pipe,
+    Question(usize),
     Begin,
     Match,
 }
 
 impl Type {
-    fn captured_prev_state_is_valid(&self) -> bool {
-        #[allow(clippy::match_like_matches_macro)]
+    fn take_literal(&self) -> Option<usize> {
         match self {
-            Type::Star(s) | Type::Question(s) if matches!(s.as_ref(), Type::Star(_) | Type::Plus(_) | Type::Question(_)) => false,
-            _ => true
-        }
-    }
-
-    fn passed_prev_state_is_valid(&self, s: &Self) -> bool {
-        #[allow(clippy::match_like_matches_macro)]
-        match self {
-            Type::Plus(_) if matches!(s, Type::Plus(_)) => false,
-            Type::Pipe if matches!(s, Type::Pipe) => false,
-            Type::Match if matches!(s, Type::Pipe) => false,
-            _ => true
+            Type::Literal(ch) => Some(*ch),
+            _ => None
         }
     }
 }
@@ -142,10 +129,10 @@ impl Regex {
     // Finish the regex by adding a `Match` state transition to the final node and all
     // of the end nodes captured in the ends vector. The `Match` state is the final state
     // in the state machine and is used to determine if the regex has matched the input.
-    fn finish_regex(&mut self, last_state: Option<State>) -> Result<(), Box<dyn Error>> {
+    fn finish_regex(&mut self, last_char: char) -> Result<(), Box<dyn Error>> {
         let state = State::new(Type::Match, vec![]);
 
-        if !state.t.passed_prev_state_is_valid(&last_state.unwrap().t) {
+        if last_char == '|' {
             return Err("Invalid regex, compilation failed".into())
         }
         let new_ptr = self.ptr + 1;
@@ -160,30 +147,31 @@ impl Regex {
     // that hold references to the possible next states in the state machine.
     fn compile(pattern: &str) -> Result<Self, Box<dyn Error>> {
         let mut regex = Regex::new();
-        let mut last_state = None;
+        if pattern.is_empty() {
+            return Err("Invalid regex, compilation failed. Empty patterns are not allowed".into())
+        }
+        let mut last_char = '\0';
+
         for c in pattern.chars() {
             match c {
                 '.' => {
                     // create a new state that can always transition to the next state and push it to the state machine.
-                    // The pointed is incremented here and the previous node's transitions are updated to include the new state
-                    let state = State::new(Type::Dot, vec![]);
+                    // The pointer is incremented here and the previous node's transitions are updated to include the new state
+                    let state = State::new(Type::Literal(256), vec![]);
                     let new_ptr = regex.ptr + 1;
                     regex.update_previous_nodes(regex.ptr, new_ptr);
                     // Save the new state and head pointer
-                    last_state = Some(state.clone());
                     regex.states.push(state);
                     regex.ptr = new_ptr;
                 },
                 '*' => {
                     // Take the current head of the state machine so it can be replaced
                     let t = regex.take_current_state().t;
-                    // Create a new state to replace the current head with that can transition to itself.
-                    let transitions = vec![regex.ptr];
-                    let state = State::new(Type::Star(Box::new(t)), transitions);
-                    // Check if the previous state is valid for a '*' meta character
-                    if !state.t.captured_prev_state_is_valid() { return Err("Invalid regex, compilation failed".into()) }
-                    // Save the new state and head pointer
-                    last_state = Some(state.clone());
+                    let node = match t.take_literal() {
+                        Some(ch) => Type::Star(ch),
+                        None => { return Err("Invalid regex, compilation failed. Found metacharacter expected literal".into()) }
+                    };
+                    let state = State::new(node, vec![regex.ptr]);
                     // Replace the previous head with the new state. The head pointer is not incremented here because we are
                     // replacing a state that was already in the state machine. We dont need to
                     // update the previous node either because the insertion of the original state
@@ -191,17 +179,14 @@ impl Regex {
                     regex.states.push(state);
                 },
                 '+' => {
+                    let node = match regex.get_current_state().t.take_literal() {
+                        Some(ch) => Type::Plus(ch),
+                        None => { return Err("Invalid regex, compilation failed. Found metacharacter expected literal".into()) }
+                    };
                     // Create a new state that can transition to itself or the next state. Here we
                     // increment the head pointer because we are adding a new state to the state machine
                     let new_ptr = regex.ptr + 1;
-                    let transitions = vec![new_ptr];
-                    let state = State::new(Type::Plus(regex.ptr), transitions);
-                    // Get a reference to the current head of the state machine so we can clone it and use it in the new state
-                    let t = &regex.get_current_state().t;
-                    // check if the previous state is valid for a '+' meta character
-                    if !state.t.passed_prev_state_is_valid(t) { return Err("Invalid regex, compilation failed".into()) }
-                    // Save the new state and head pointer
-                    last_state = Some(state.clone());
+                    let state = State::new(node, vec![new_ptr]);
                     // Update the previous node's transitions to include the new state and store
                     // the new state and head pointer
                     regex.update_previous_nodes(regex.ptr, new_ptr);
@@ -209,14 +194,14 @@ impl Regex {
                     regex.ptr = new_ptr;
                 },
                 '?' => {
-                    // Take the current head of the state machine so it can be replaced
                     let t = regex.take_current_state().t;
+                    let node = match t.take_literal() {
+                        Some(ch) => Type::Question(ch),
+                        None => { return Err("Invalid regex, compilation failed. Found metacharacter expected literal".into()) }
+                    };
                     // Create a new state that can transition to the next state or be skipped and push it to the state machine.
-                    let state = State::new(Type::Question(Box::new(t)), vec![]);
-                    // Check if the previous state is valid for a '?' meta character
-                    if !state.t.captured_prev_state_is_valid() { return Err("Invalid regex, compilation failed".into()) }
+                    let state = State::new(node, vec![]);
                     // Save the new state and head pointer
-                    last_state = Some(state.clone());
                     regex.states.push(state);
                 },
                 '|' => {
@@ -225,29 +210,25 @@ impl Regex {
                     // current groups ends. For the top level group this will be the `Match` state.
                     regex.ends.push(regex.ptr);
                     // Create a new state that is linked current anchor node and push it to the state machine.
-                    let state = State::new(Type::Pipe, vec![]);
-                    // Check if the previous state is valid for a '|' meta character
-                    if !state.t.passed_prev_state_is_valid(&regex.get_current_state().t) { return Err("Invalid regex, compilation failed".into()) }
                     // Save the new state and head pointer
-                    last_state = Some(state);
                     let new_ptr = regex.ptr + 1;
                     regex.update_anchor_node(new_ptr);
                 },
                 c => {
                     // Create a new state that can only transition to the next state if the contained literal matches
                     // and push it to the state machine.
-                    let state = State::new(Type::Literal(c), vec![]);
+                    let state = State::new(Type::Literal(c as usize), vec![]);
                     let new_ptr = regex.ptr + 1;
                     regex.update_previous_nodes(regex.ptr, new_ptr);
                     // Save the new state and head pointer
-                    last_state = Some(state.clone());
                     regex.states.push(state);
                     regex.ptr = new_ptr;
                 }
             }
+            last_char = c;
         }
         // Once we have finished processing the pattern we need to update the nodes in the end
-        regex.finish_regex(last_state)?;
+        regex.finish_regex(last_char)?;
         Ok(regex)
     }
 
@@ -271,49 +252,11 @@ impl Regex {
     // If the transition is valid, push it to the next_states vector
     fn step(&self, transition: usize, c: char, new_states: &mut Vec<usize>) {
         match &self.states[transition].t {
-            Type::Literal(ch) => {
-                if c == *ch {
+            Type::Literal(ch) | Type::Star(ch) | Type::Question(ch) | Type::Plus(ch)  => {
+                if *ch == 256 || c as usize == *ch {
                     new_states.push(transition);
                     println!("character: {} matched state: {:?}", c, &self.states[transition].t);
                 }
-            },
-            Type::Dot => {
-                new_states.push(transition);
-                println!("character: {} matched state: {:?}", c, &self.states[transition].t);
-            },
-            Type::Star(typ) | Type::Question(typ) => {
-                match **typ {
-                    Type::Literal(ch) => {
-                        if c == ch {
-                            new_states.push(transition);
-                            println!("character: {} matched state: {:?}", c, &self.states[transition].t);
-                        }
-                    },
-                    Type::Dot => {
-                        new_states.push(transition);
-                        println!( "{} matched state: {:?}", c, &self.states[transition].t);
-                    },
-                    _ => unreachable!(),
-                };
-            },
-            Type::Plus(ptr) => {
-                match self.states[*ptr].t {
-                    Type::Literal(ch) => {
-                        if c == ch {
-                            new_states.push(transition);
-                            println!("character: {} matched state: {:?}", c, &self.states[transition].t);
-                        }
-                    },
-                    Type::Dot => {
-                        new_states.push(transition);
-                        println!( "{} matched state: {:?}", c, &self.states[transition].t);
-                    },
-                    _ => unreachable!(),
-                };
-            },
-            Type::Pipe => {
-                new_states.push(transition);
-                println!( "{} matched state: {:?}", c, &self.states[transition].t);
             },
             Type::Match => {
                 new_states.push(transition);
@@ -376,7 +319,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     //     Ok(false) => println!("Not matched"),
     //     Err(e) => println!("Error: {}", e)
     // }
-    match is_match("aaaa b  d".to_string(), "a+ b? c* d".to_string()) {
+    match is_match("aaaad".to_string(), "a+b?c*d".to_string()) {
         Ok(true) => println!("Matched"),
         Ok(false) => println!("Not matched"),
         Err(e) => println!("Error: {}", e)
